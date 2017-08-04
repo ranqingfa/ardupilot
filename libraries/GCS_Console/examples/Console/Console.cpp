@@ -1,13 +1,6 @@
-// -*- Mode: C++; c-basic-offset: 8; indent-tabs-mode: nil -*-
-
-//
-// Example code for the AP_HAL AVRUARTDriver, based on FastSerial
-//
 // This code is placed into the public domain.
-//
 
 #include <AP_Common/AP_Common.h>
-#include <AP_Progmem/AP_Progmem.h>
 #include <AP_HAL/AP_HAL.h>
 
 #include <AP_Param/AP_Param.h>
@@ -33,13 +26,13 @@ void flush_console_to_statustext() {
 void console_loopback() {
     int a = hal.console->available();
     if (a > 0) {
-        hal.console->print("Console loopback:");
+        hal.console->printf("Console loopback:");
         int r = hal.console->read();
         while (r > 0) {
             hal.console->write( (uint8_t) r );
             r = hal.console->read();
         }
-        hal.console->println();
+        hal.console->printf("\n");
     }   
 }
 
@@ -54,7 +47,7 @@ void setup(void) {
     try_send_statustext(MAVLINK_COMM_0, hello, strlen(hello));
 
     hal.console->backend_open();
-    hal.console->printf_P(PSTR("Hello hal.console\r\n"));
+    hal.console->printf("Hello hal.console\r\n");
 }
 
 int i = 0;

@@ -1,4 +1,3 @@
-/// -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
 /*
   AP_Nav_Common holds definitions shared by inertial and ekf nav filters
 
@@ -15,9 +14,7 @@
   You should have received a copy of the GNU General Public License
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#ifndef AP_Nav_Common
-#define AP_Nav_Common
+#pragma once
 
 union nav_filter_status {
     struct {
@@ -52,8 +49,22 @@ union nav_gps_status {
         uint16_t bad_vert_vel       : 1; // 7 - true if the GPS vertical speed is too large to start using GPS (this check assumes vehicle is static)
         uint16_t bad_fix            : 1; // 8 - true if the GPS is not providing a 3D fix
         uint16_t bad_horiz_vel      : 1; // 9 - true if the GPS horizontal speed is excessive (this check assumes the vehicle is static)
+        uint16_t bad_vAcc           : 1; // 10 - true if reported gps vertical position accuracy is insufficient to start using GPS
     } flags;
     uint16_t value;
 };
 
-#endif // AP_Nav_Common
+/*
+  structure to hold EKF timing statistics
+ */
+struct ekf_timing {
+    uint32_t count;
+    float dtIMUavg_min;
+    float dtIMUavg_max;
+    float dtEKFavg_min;
+    float dtEKFavg_max;
+    float delAngDT_max;
+    float delAngDT_min;
+    float delVelDT_max;
+    float delVelDT_min;
+};

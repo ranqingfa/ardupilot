@@ -1,4 +1,3 @@
-/// -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
 /*
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -19,13 +18,22 @@
  *  Author: Andrew Tridgell, January 2013
  *
  */
-
-#ifndef AP_SCHEDULER_H
-#define AP_SCHEDULER_H
+#pragma once
 
 #include <AP_Param/AP_Param.h>
+#include <AP_HAL/Util.h>
 
 #define AP_SCHEDULER_NAME_INITIALIZER(_name) .name = #_name,
+
+/*
+  useful macro for creating scheduler task table
+ */
+#define SCHED_TASK_CLASS(classname, classptr, func, _rate_hz, _max_time_micros) { \
+    .function = FUNCTOR_BIND(classptr, &classname::func, void),\
+    AP_SCHEDULER_NAME_INITIALIZER(func)\
+    .rate_hz = _rate_hz,\
+    .max_time_micros = _max_time_micros\
+}
 
 /*
   A task scheduler for APM main loops
@@ -43,12 +51,15 @@
 class AP_Scheduler
 {
 public:
+    // constructor
+    AP_Scheduler(void);
+    
     FUNCTOR_TYPEDEF(task_fn_t, void);
 
     struct Task {
         task_fn_t function;
         const char *name;
-        uint16_t interval_ticks;
+        float rate_hz;
         uint16_t max_time_micros;
     };
 
@@ -61,7 +72,7 @@ public:
     // run the tasks. Call this once per 'tick'.
     // time_available is the amount of time available to run
     // tasks in microseconds
-    void run(uint16_t time_available);
+    void run(uint32_t time_available);
 
     // return the number of microseconds available for the current task
     uint16_t time_available_usec(void);
@@ -72,7 +83,16 @@ public:
     // return load average, as a number between 0 and 1. 1 means
     // 100% load. Calculated from how much spare time we have at the
     // end of a run()
-    float load_average(uint32_t tick_time_usec) const;
+    float load_average() const;
+
+    // get the configured main loop rate
+    uint16_t get_loop_rate_hz(void) const {
+        return _loop_rate_hz;
+    }
+    // get the time-allowed-per-loop:
+    uint32_t get_loop_period_us() const {
+        return 1000000UL / _loop_rate_hz;
+    }
 
     static const struct AP_Param::GroupInfo var_info[];
 
@@ -83,6 +103,9 @@ private:
     // used to enable scheduler debugging
     AP_Int8 _debug;
 
+    // overall scheduling rate in Hz
+    AP_Int16 _loop_rate_hz;  // The value of this variable can be changed with the non-initialization. (Ex. Tuning by GDB)
+    
     // progmem list of tasks to run
     const struct Task *_tasks;
 
@@ -107,6 +130,7 @@ private:
 
     // number of ticks that _spare_micros is counted over
     uint8_t _spare_ticks;
-};
 
-#endif // AP_SCHEDULER_H
+    // performance counters
+    AP_HAL::Util::perf_counter_t *_perf_counters;
+};

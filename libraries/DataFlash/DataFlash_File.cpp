@@ -1,5 +1,3 @@
-/// -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
-
 /* 
    DataFlash logging - file oriented variant
 
@@ -17,6 +15,7 @@
 #if HAL_OS_POSIX_IO
 #include "DataFlash_File.h"
 
+#include <AP_Common/AP_Common.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -30,14 +29,13 @@
 #include <stdio.h>
 #include <time.h>
 #include <dirent.h>
-#include <AP_HAL/utility/RingBuffer.h>
-#ifdef __APPLE__
+#include <GCS_MAVLink/GCS.h>
+#if defined(__APPLE__) && defined(__MACH__)
 #include <sys/param.h>
 #include <sys/mount.h>
-#else
+#elif !DATAFLASH_FILE_MINIMAL
 #include <sys/statfs.h>
 #endif
-
 extern const AP_HAL::HAL& hal;
 
 #define MAX_LOG_FILES 500U
@@ -46,18 +44,19 @@ extern const AP_HAL::HAL& hal;
 /*
   constructor
  */
-DataFlash_File::DataFlash_File(DataFlash_Class &front, const char *log_directory) :
-    DataFlash_Backend(front),
+DataFlash_File::DataFlash_File(DataFlash_Class &front,
+                               DFMessageWriter_DFLogStart *writer,
+                               const char *log_directory) :
+    DataFlash_Backend(front, writer),
     _write_fd(-1),
     _read_fd(-1),
     _read_fd_log_num(0),
     _read_offset(0),
     _write_offset(0),
-    _initialised(false),
     _open_error(false),
     _log_directory(log_directory),
-    _writebuf(NULL),
-    _writebuf_size(16*1024),
+    _cached_oldest_log(0),
+    _writebuf(0),
 #if defined(CONFIG_ARCH_BOARD_PX4FMU_V1)
     // V1 gets IO errors with larger than 512 byte writes
     _writebuf_chunk(512),
@@ -76,8 +75,6 @@ DataFlash_File::DataFlash_File(DataFlash_Class &front, const char *log_directory
 #else
     _writebuf_chunk(4096),
 #endif
-    _writebuf_head(0),
-    _writebuf_tail(0),
     _last_write_time(0),
     _perf_write(hal.util->perf_alloc(AP_HAL::Util::PC_ELAPSED, "DF_write")),
     _perf_fsync(hal.util->perf_alloc(AP_HAL::Util::PC_ELAPSED, "DF_fsync")),
@@ -86,19 +83,24 @@ DataFlash_File::DataFlash_File(DataFlash_Class &front, const char *log_directory
 {}
 
 
-// initialisation
-void DataFlash_File::Init(const struct LogStructure *structure, uint8_t num_types)
+void DataFlash_File::Init()
 {
-    DataFlash_Backend::Init(structure, num_types);
+    DataFlash_Backend::Init();
     // create the log directory if need be
     int ret;
     struct stat st;
+
+    semaphore = hal.util->new_semaphore();
+    if (semaphore == nullptr) {
+        AP_HAL::panic("Failed to create DataFlash_File semaphore");
+        return;
+    }
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_PX4 || CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
     // try to cope with an existing lowercase log directory
     // name. NuttX does not handle case insensitive VFAT well
     DIR *d = opendir("/fs/microsd/APM");
-    if (d != NULL) {
+    if (d != nullptr) {
         for (struct dirent *de=readdir(d); de; de=readdir(d)) {
             if (strcmp(de->d_name, "logs") == 0) {
                 rename("/fs/microsd/APM/logs", "/fs/microsd/APM/OLDLOGS");
@@ -110,10 +112,11 @@ void DataFlash_File::Init(const struct LogStructure *structure, uint8_t num_type
 #endif
 
     const char* custom_dir = hal.util->get_custom_log_directory();
-    if (custom_dir != NULL){
+    if (custom_dir != nullptr){
         _log_directory = custom_dir;
     }
 
+#if !DATAFLASH_FILE_MINIMAL
     ret = stat(_log_directory, &st);
     if (ret == -1) {
         ret = mkdir(_log_directory, 0777);
@@ -122,45 +125,55 @@ void DataFlash_File::Init(const struct LogStructure *structure, uint8_t num_type
         hal.console->printf("Failed to create log directory %s\n", _log_directory);
         return;
     }
-    if (_writebuf != NULL) {
-        free(_writebuf);
-        _writebuf = NULL;
+#endif
+
+    // determine and limit file backend buffersize
+    uint32_t bufsize = _front._params.file_bufsize;
+    if (bufsize > 64) {
+        bufsize = 64; // PixHawk has DMA limitations.
+    }
+    bufsize *= 1024;
+
+    // If we can't allocate the full size, try to reduce it until we can allocate it
+    while (!_writebuf.set_size(bufsize) && bufsize >= _writebuf_chunk) {
+        hal.console->printf("DataFlash_File: Couldn't set buffer size to=%u\n", (unsigned)bufsize);
+        bufsize >>= 1;
     }
 
-    /*
-      if we can't allocate the full writebuf then try reducing it
-      until we can allocate it
-     */
-    while (_writebuf == NULL && _writebuf_size >= _writebuf_chunk) {
-        _writebuf = (uint8_t *)malloc(_writebuf_size);
-        if (_writebuf == NULL) {
-            _writebuf_size /= 2;
-        }
-    }
-    if (_writebuf == NULL) {
+    if (!_writebuf.get_size()) {
         hal.console->printf("Out of memory for logging\n");
-        return;        
+        return;
     }
-    _writebuf_head = _writebuf_tail = 0;
+
+    hal.console->printf("DataFlash_File: buffer size=%u\n", (unsigned)bufsize);
+
     _initialised = true;
     hal.scheduler->register_io_process(FUNCTOR_BIND_MEMBER(&DataFlash_File::_io_timer, void));
 }
 
 bool DataFlash_File::file_exists(const char *filename) const
 {
+#if DATAFLASH_FILE_MINIMAL
+    int fd = open(filename, O_RDONLY|O_CLOEXEC);
+    if (fd == -1) {
+        return false;
+    }
+    close(fd);
+#else
     struct stat st;
     if (stat(filename, &st) == -1) {
         // hopefully errno==ENOENT.  If some error occurs it is
         // probably better to assume this file exists.
         return false;
     }
+#endif
     return true;
 }
 
 bool DataFlash_File::log_exists(const uint16_t lognum) const
 {
     char *filename = _log_file_name(lognum);
-    if (filename == NULL) {
+    if (filename == nullptr) {
         // internal_error();
         return false; // ?!
     }
@@ -169,19 +182,38 @@ bool DataFlash_File::log_exists(const uint16_t lognum) const
     return ret;
 }
 
+void DataFlash_File::periodic_1Hz(const uint32_t now)
+{
+    if (!io_thread_alive()) {
+        if (io_thread_warning_decimation_counter == 0) {
+            gcs().send_text(MAV_SEVERITY_CRITICAL, "No IO Thread Heartbeat (%s)", last_io_operation);
+        }
+        if (io_thread_warning_decimation_counter++ > 57) {
+            io_thread_warning_decimation_counter = 0;
+        }
+        // If you try to close the file here then it will almost
+        // certainly block.  Since this is the main thread, this is
+        // likely to cause a crash.
+        _write_fd = -1;
+        _initialised = false;
+    }
+}
+
 void DataFlash_File::periodic_fullrate(const uint32_t now)
 {
     DataFlash_Backend::push_log_blocks();
 }
 
-uint16_t DataFlash_File::bufferspace_available()
+uint32_t DataFlash_File::bufferspace_available()
 {
-    uint16_t _head;
-    return (BUF_SPACE(_writebuf)) - critical_message_reserved_space();
+    const uint32_t space = _writebuf.space();
+    const uint32_t crit = critical_message_reserved_space();
+
+    return (space > crit) ? space - crit : 0;
 }
 
-// return true for CardInserted() if we successfully initialised
-bool DataFlash_File::CardInserted(void)
+// return true for CardInserted() if we successfully initialized
+bool DataFlash_File::CardInserted(void) const
 {
     return _initialised && !_open_error;
 }
@@ -190,11 +222,16 @@ bool DataFlash_File::CardInserted(void)
 // returns -1 on error
 int64_t DataFlash_File::disk_space_avail()
 {
+#if !DATAFLASH_FILE_MINIMAL
     struct statfs stats;
     if (statfs(_log_directory, &stats) < 0) {
         return -1;
     }
     return (((int64_t)stats.f_bavail) * stats.f_bsize);
+#else
+    // return a fake disk space size
+    return 100*1000*1000UL;
+#endif
 }
 
 // returns the total amount of disk space (in use + available) in
@@ -202,11 +239,16 @@ int64_t DataFlash_File::disk_space_avail()
 // returns -1 on error
 int64_t DataFlash_File::disk_space()
 {
+#if !DATAFLASH_FILE_MINIMAL
     struct statfs stats;
     if (statfs(_log_directory, &stats) < 0) {
         return -1;
     }
     return (((int64_t)stats.f_blocks) * stats.f_bsize);
+#else
+    // return fake disk space size
+    return 200*1000*1000UL;
+#endif
 }
 
 // returns the available space in _log_directory as a percentage
@@ -229,6 +271,13 @@ float DataFlash_File::avail_space_percent()
 // returns 0 if no log was found
 uint16_t DataFlash_File::find_oldest_log()
 {
+#if DATAFLASH_FILE_MINIMAL
+    return 0;
+#else
+    if (_cached_oldest_log != 0) {
+        return _cached_oldest_log;
+    }
+
     uint16_t last_log_num = find_last_log();
     if (last_log_num == 0) {
         return 0;
@@ -240,7 +289,7 @@ uint16_t DataFlash_File::find_oldest_log()
     // relying on the min_avail_space_percent feature we could end up
     // doing a *lot* of asprintf()s and stat()s
     DIR *d = opendir(_log_directory);
-    if (d == NULL) {
+    if (d == nullptr) {
         // internal_error();
         return 0;
     }
@@ -257,7 +306,7 @@ uint16_t DataFlash_File::find_oldest_log()
             continue;
         }
 
-        uint16_t thisnum = strtoul(de->d_name, NULL, 10);
+        uint16_t thisnum = strtoul(de->d_name, nullptr, 10);
         if (thisnum > MAX_LOG_FILES) {
             // ignore files above our official maximum...
             continue;
@@ -281,10 +330,13 @@ uint16_t DataFlash_File::find_oldest_log()
         }
     }
     closedir(d);
+    _cached_oldest_log = current_oldest_log;
 
     return current_oldest_log;
+#endif
 }
 
+#if !DATAFLASH_FILE_MINIMAL
 void DataFlash_File::Prep_MinSpace()
 {
     const uint16_t first_log_to_remove = find_oldest_log();
@@ -292,6 +344,8 @@ void DataFlash_File::Prep_MinSpace()
         // no files to remove
         return;
     }
+
+    _cached_oldest_log = 0;
 
     uint16_t log_to_remove = first_log_to_remove;
 
@@ -311,13 +365,13 @@ void DataFlash_File::Prep_MinSpace()
             break;
         }
         char *filename_to_remove = _log_file_name(log_to_remove);
-        if (filename_to_remove == NULL) {
+        if (filename_to_remove == nullptr) {
             // internal_error();
             break;
         }
         if (file_exists(filename_to_remove)) {
             hal.console->printf("Removing (%s) for minimum-space requirements (%.2f%% < %.0f%%)\n",
-                                filename_to_remove, avail, min_avail_space_percent);
+                                filename_to_remove, (double)avail, (double)min_avail_space_percent);
             if (unlink(filename_to_remove) == -1) {
                 hal.console->printf("Failed to remove %s: %s\n", filename_to_remove, strerror(errno));
                 free(filename_to_remove);
@@ -339,13 +393,19 @@ void DataFlash_File::Prep_MinSpace()
         }
     } while (log_to_remove != first_log_to_remove);
 }
+#endif
 
 void DataFlash_File::Prep() {
+    if (!NeedPrep()) {
+        return;
+    }
     if (hal.util->get_soft_armed()) {
         // do not want to do any filesystem operations while we are e.g. flying
         return;
     }
+#if !DATAFLASH_FILE_MINIMAL
     Prep_MinSpace();
+#endif
 }
 
 bool DataFlash_File::NeedPrep()
@@ -364,15 +424,49 @@ bool DataFlash_File::NeedPrep()
 
 /*
   construct a log file name given a log number. 
+  The number in the log filename will *not* be zero-padded.
+  Note: Caller must free.
+ */
+char *DataFlash_File::_log_file_name_short(const uint16_t log_num) const
+{
+    char *buf = nullptr;
+    if (asprintf(&buf, "%s/%u.BIN", _log_directory, (unsigned)log_num) == -1) {
+        return nullptr;
+    }
+    return buf;
+}
+
+/*
+  construct a log file name given a log number.
+  The number in the log filename will be zero-padded.
+  Note: Caller must free.
+ */
+char *DataFlash_File::_log_file_name_long(const uint16_t log_num) const
+{
+    char *buf = nullptr;
+    if (asprintf(&buf, "%s/%08u.BIN", _log_directory, (unsigned)log_num) == -1) {
+        return nullptr;
+    }
+    return buf;
+}
+
+/*
+  return a log filename appropriate for the supplied log_num if a
+  filename exists with the short (not-zero-padded name) then it is the
+  appropirate name, otherwise the long (zero-padded) version is.
   Note: Caller must free.
  */
 char *DataFlash_File::_log_file_name(const uint16_t log_num) const
 {
-    char *buf = NULL;
-    if (asprintf(&buf, "%s/%u.BIN", _log_directory, (unsigned)log_num) == 0) {
-        return NULL;
+    char *filename = _log_file_name_short(log_num);
+    if (filename == nullptr) {
+        return nullptr;
     }
-    return buf;
+    if (file_exists(filename)) {
+        return filename;
+    }
+    free(filename);
+    return _log_file_name_long(log_num);
 }
 
 /*
@@ -381,9 +475,9 @@ char *DataFlash_File::_log_file_name(const uint16_t log_num) const
  */
 char *DataFlash_File::_lastlog_file_name(void) const
 {
-    char *buf = NULL;
-    if (asprintf(&buf, "%s/LASTLOG.TXT", _log_directory) == 0) {
-        return NULL;
+    char *buf = nullptr;
+    if (asprintf(&buf, "%s/LASTLOG.TXT", _log_directory) == -1) {
+        return nullptr;
     }
     return buf;
 }
@@ -393,51 +487,80 @@ char *DataFlash_File::_lastlog_file_name(void) const
 void DataFlash_File::EraseAll()
 {
     uint16_t log_num;
+    const bool was_logging = (_write_fd != -1);
     stop_logging();
+#if !DATAFLASH_FILE_MINIMAL
     for (log_num=1; log_num<=MAX_LOG_FILES; log_num++) {
         char *fname = _log_file_name(log_num);
-        if (fname == NULL) {
+        if (fname == nullptr) {
             break;
         }
         unlink(fname);
         free(fname);
     }
     char *fname = _lastlog_file_name();
-    if (fname != NULL) {
+    if (fname != nullptr) {
         unlink(fname);
         free(fname);
     }
+#endif
+    _cached_oldest_log = 0;
+
+    if (was_logging) {
+        start_new_log();
+    }
+}
+
+bool DataFlash_File::WritesOK() const
+{
+    if (_write_fd == -1) {
+        return false;
+    }
+    if (_open_error) {
+        return false;
+    }
+    return true;
+}
+
+
+bool DataFlash_File::StartNewLogOK() const
+{
+    if (_open_error) {
+        return false;
+    }
+    return DataFlash_Backend::StartNewLogOK();
 }
 
 /* Write a block of data at current offset */
-bool DataFlash_File::WritePrioritisedBlock(const void *pBuffer, uint16_t size, bool is_critical)
+bool DataFlash_File::_WritePrioritisedBlock(const void *pBuffer, uint16_t size, bool is_critical)
 {
-    if (_write_fd == -1 || !_initialised || _open_error || !_writes_enabled) {
-        return false;
-    }
-
     if (! WriteBlockCheckStartupMessages()) {
         _dropped++;
         return false;
     }
 
-    uint16_t _head;
-    uint16_t space = BUF_SPACE(_writebuf);
+    if (!semaphore->take(1)) {
+        return false;
+    }
+        
+    uint32_t space = _writebuf.space();
 
     if (_writing_startup_messages &&
-        _front._startup_messagewriter.fmt_done()) {
+        _startup_messagewriter->fmt_done()) {
         // the state machine has called us, and it has finished
         // writing format messages out.  It can always get back to us
         // with more messages later, so let's leave room for other
         // things:
         if (space < non_messagewriter_message_reserved_space()) {
             // this message isn't dropped, it will be sent again...
+            semaphore->give();
             return false;
         }
     } else {
         // we reserve some amount of space for critical messages:
         if (!is_critical && space < critical_message_reserved_space()) {
             _dropped++;
+            semaphore->give();
             return false;
         }
     }
@@ -446,29 +569,12 @@ bool DataFlash_File::WritePrioritisedBlock(const void *pBuffer, uint16_t size, b
     if (space < size) {
         hal.util->perf_count(_perf_overruns);
         _dropped++;
+        semaphore->give();
         return false;
     }
 
-    if (_writebuf_tail < _head) {
-        // perform as single memcpy
-        assert(_writebuf_tail+size <= _writebuf_size);
-        memcpy(&_writebuf[_writebuf_tail], pBuffer, size);
-        BUF_ADVANCETAIL(_writebuf, size);
-    } else {
-        // perform as two memcpy calls
-        uint16_t n = _writebuf_size - _writebuf_tail;
-        if (n > size) n = size;
-        assert(_writebuf_tail+n <= _writebuf_size);
-        memcpy(&_writebuf[_writebuf_tail], pBuffer, n);
-        BUF_ADVANCETAIL(_writebuf, n);
-        pBuffer = (const void *)(((const uint8_t *)pBuffer) + n);
-        n = size - n;
-        if (n > 0) {
-            assert(_writebuf_tail+n <= _writebuf_size);
-            memcpy(&_writebuf[_writebuf_tail], pBuffer, n);
-            BUF_ADVANCETAIL(_writebuf, n);
-        }
-    }
+    _writebuf.write((uint8_t*)pBuffer, size);
+    semaphore->give();
     return true;
 }
 
@@ -497,27 +603,29 @@ uint16_t DataFlash_File::find_last_log()
 {
     unsigned ret = 0;
     char *fname = _lastlog_file_name();
-    if (fname == NULL) {
+    if (fname == nullptr) {
         return ret;
     }
-    FILE *f = ::fopen(fname, "r");
+    int fd = open(fname, O_RDONLY|O_CLOEXEC);
     free(fname);
-    if (f != NULL) {
+    if (fd != -1) {
         char buf[10];
         memset(buf, 0, sizeof(buf));
-        // PX4 doesn't have fscanf()
-        if (fread(buf, 1, sizeof(buf)-1, f) > 0) {
+        if (read(fd, buf, sizeof(buf)-1) > 0) {
             sscanf(buf, "%u", &ret);            
         }
-        fclose(f);    
+        close(fd);    
     }
     return ret;
 }
 
 uint32_t DataFlash_File::_get_log_size(const uint16_t log_num) const
 {
+#if DATAFLASH_FILE_MINIMAL
+    return 1;
+#else
     char *fname = _log_file_name(log_num);
-    if (fname == NULL) {
+    if (fname == nullptr) {
         return 0;
     }
     struct stat st;
@@ -527,12 +635,16 @@ uint32_t DataFlash_File::_get_log_size(const uint16_t log_num) const
     }
     free(fname);
     return st.st_size;
+#endif
 }
 
 uint32_t DataFlash_File::_get_log_time(const uint16_t log_num) const
 {
+#if DATAFLASH_FILE_MINIMAL
+    return 0;
+#else
     char *fname = _log_file_name(log_num);
-    if (fname == NULL) {
+    if (fname == nullptr) {
         return 0;
     }
     struct stat st;
@@ -542,6 +654,7 @@ uint32_t DataFlash_File::_get_log_time(const uint16_t log_num) const
     }
     free(fname);
     return st.st_mtime;
+#endif
 }
 
 /*
@@ -584,7 +697,7 @@ void DataFlash_File::get_log_boundaries(const uint16_t list_entry, uint16_t & st
 }
 
 /*
-  find the number of pages in a log
+  retrieve data from a log file
  */
 int16_t DataFlash_File::get_log_data(const uint16_t list_entry, const uint16_t page, const uint32_t offset, const uint16_t len, uint8_t *data)
 {
@@ -604,11 +717,11 @@ int16_t DataFlash_File::get_log_data(const uint16_t list_entry, const uint16_t p
     }
     if (_read_fd == -1) {
         char *fname = _log_file_name(log_num);
-        if (fname == NULL) {
+        if (fname == nullptr) {
             return -1;
         }
         stop_logging();
-        _read_fd = ::open(fname, O_RDONLY);
+        _read_fd = ::open(fname, O_RDONLY|O_CLOEXEC);
         if (_read_fd == -1) {
             _open_error = true;
             int saved_errno = errno;
@@ -636,13 +749,26 @@ int16_t DataFlash_File::get_log_data(const uint16_t list_entry, const uint16_t p
     */
     if (ofs / 4096 != (ofs+len) / 4096) {
         off_t seek_current = ::lseek(_read_fd, 0, SEEK_CUR);
+        if (seek_current == (off_t)-1) {
+            close(_read_fd);
+            _read_fd = -1;
+            return -1;
+        }
         if (seek_current != (off_t)_read_offset) {
-            ::lseek(_read_fd, _read_offset, SEEK_SET);
+            if (::lseek(_read_fd, _read_offset, SEEK_SET) == (off_t)-1) {
+                close(_read_fd);
+                _read_fd = -1;
+                return -1;
+            }
         }
     }
 
     if (ofs != _read_offset) {
-        ::lseek(_read_fd, ofs, SEEK_SET);
+        if (::lseek(_read_fd, ofs, SEEK_SET) == (off_t)-1) {
+            close(_read_fd);
+            _read_fd = -1;
+            return -1;
+        }
         _read_offset = ofs;
     }
     int16_t ret = (int16_t)::read(_read_fd, data, len);
@@ -704,11 +830,17 @@ void DataFlash_File::stop_logging(void)
     if (_write_fd != -1) {
         int fd = _write_fd;
         _write_fd = -1;
-        log_write_started = false;
         ::close(fd);
     }
 }
 
+void DataFlash_File::PrepForArming()
+{
+    if (logging_started()) {
+        return;
+    }
+    start_new_log();
+}
 
 /*
   start writing to a new log file
@@ -716,6 +848,8 @@ void DataFlash_File::stop_logging(void)
 uint16_t DataFlash_File::start_new_log(void)
 {
     stop_logging();
+
+    start_new_log_reset_variables();
 
     if (_open_error) {
         // we have previously failed to open a file - don't try again
@@ -728,6 +862,12 @@ uint16_t DataFlash_File::start_new_log(void)
         _read_fd = -1;
     }
 
+    if (disk_space_avail() < _free_space_min_avail) {
+        hal.console->printf("Out of space for logging\n");
+        _open_error = true;
+        return 0xffff;
+    }
+
     uint16_t log_num = find_last_log();
     // re-use empty logs if possible
     if (_get_log_size(log_num) > 0 || log_num == 0) {
@@ -737,7 +877,13 @@ uint16_t DataFlash_File::start_new_log(void)
         log_num = 1;
     }
     char *fname = _log_file_name(log_num);
-    _write_fd = ::open(fname, O_WRONLY|O_CREAT|O_TRUNC, 0666);
+    if (fname == nullptr) {
+        _open_error = true;
+        return 0xFFFF;
+    }
+    _write_fd = ::open(fname, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666);
+    _cached_oldest_log = 0;
+
     if (_write_fd == -1) {
         _initialised = false;
         _open_error = true;
@@ -751,16 +897,30 @@ uint16_t DataFlash_File::start_new_log(void)
     }
     free(fname);
     _write_offset = 0;
-    _writebuf_head = 0;
-    _writebuf_tail = 0;
-    log_write_started = true;
+    _writebuf.clear();
 
     // now update lastlog.txt with the new log number
     fname = _lastlog_file_name();
-    FILE *f = ::fopen(fname, "w");
-    fprintf(f, "%u\r\n", (unsigned)log_num);
-    fclose(f);    
+
+    // we avoid fopen()/fprintf() here as it is not available on as many
+    // systems as open/write (specifically the QURT RTOS)
+    int fd = open(fname, O_WRONLY|O_CREAT|O_CLOEXEC, 0644);
     free(fname);
+    if (fd == -1) {
+        _open_error = true;
+        return 0xFFFF;
+    }
+
+    char buf[30];
+    snprintf(buf, sizeof(buf), "%u\r\n", (unsigned)log_num);
+    const ssize_t to_write = strlen(buf);
+    const ssize_t written = write(fd, buf, to_write);
+    close(fd);
+
+    if (written < to_write) {
+        _open_error = true;
+        return 0xFFFF;
+    }
 
     return log_num;
 }
@@ -788,10 +948,10 @@ void DataFlash_File::LogReadProcess(const uint16_t list_entry,
         _read_fd = -1;
     }
     char *fname = _log_file_name(log_num);
-    if (fname == NULL) {
+    if (fname == nullptr) {
         return;
     }
-    _read_fd = ::open(fname, O_RDONLY);
+    _read_fd = ::open(fname, O_RDONLY|O_CLOEXEC);
     free(fname);
     if (_read_fd == -1) {
         return;
@@ -799,7 +959,11 @@ void DataFlash_File::LogReadProcess(const uint16_t list_entry,
     _read_fd_log_num = log_num;
     _read_offset = 0;
     if (start_page != 0) {
-        ::lseek(_read_fd, start_page * DATAFLASH_PAGE_SIZE, SEEK_SET);
+        if (::lseek(_read_fd, start_page * DATAFLASH_PAGE_SIZE, SEEK_SET) == (off_t)-1) {
+            close(_read_fd);
+            _read_fd = -1;
+            return;
+        }
         _read_offset = start_page * DATAFLASH_PAGE_SIZE;
     }
 
@@ -833,9 +997,14 @@ void DataFlash_File::LogReadProcess(const uint16_t list_entry,
                 log_step = 0;
                 _print_log_entry(data, print_mode, port);
                 log_counter++;
+                // work around NuttX bug (see above for explanation)
                 if (log_counter == 10) {
                     log_counter = 0;
-                    ::lseek(_read_fd, 0, SEEK_CUR);
+                    if (::lseek(_read_fd, 0, SEEK_CUR) == (off_t)-1) {
+                        close(_read_fd);
+                        _read_fd = -1;
+                        return;
+                    }
                 }
                 break;
         }
@@ -855,13 +1024,13 @@ void DataFlash_File::LogReadProcess(const uint16_t list_entry,
  */
 void DataFlash_File::DumpPageInfo(AP_HAL::BetterStream *port)
 {
-    port->printf_P(PSTR("DataFlash: num_logs=%u\n"), 
+    port->printf("DataFlash: num_logs=%u\n", 
                    (unsigned)get_num_logs());    
 }
 
 void DataFlash_File::ShowDeviceInfo(AP_HAL::BetterStream *port)
 {
-    port->printf_P(PSTR("DataFlash logs stored in %s\n"), 
+    port->printf("DataFlash logs stored in %s\n", 
                    _log_directory);
 }
 
@@ -874,19 +1043,20 @@ void DataFlash_File::ListAvailableLogs(AP_HAL::BetterStream *port)
     uint16_t num_logs = get_num_logs();
 
     if (num_logs == 0) {
-        port->printf_P(PSTR("\nNo logs\n\n"));
+        port->printf("\nNo logs\n\n");
         return;
     }
-    port->printf_P(PSTR("\n%u logs\n"), (unsigned)num_logs);
+    port->printf("\n%u logs\n", (unsigned)num_logs);
 
+#if !DATAFLASH_FILE_MINIMAL
     for (uint16_t i=1; i<=num_logs; i++) {
         uint16_t log_num = _log_num_from_list_entry(i);
         char *filename = _log_file_name(log_num);
-        if (filename != NULL) {
+        if (filename != nullptr) {
                 struct stat st;
                 if (stat(filename, &st) == 0) {
                     struct tm *tm = gmtime(&st.st_mtime);
-                    port->printf_P(PSTR("Log %u in %s of size %u %u/%u/%u %u:%u\n"),
+                    port->printf("Log %u in %s of size %u %u/%u/%u %u:%u\n",
                                    (unsigned)i,
                                    filename,
                                    (unsigned)st.st_size,
@@ -899,20 +1069,21 @@ void DataFlash_File::ListAvailableLogs(AP_HAL::BetterStream *port)
             free(filename);
         }
     }
-    port->println();    
+#endif
+    port->printf("\n");
 }
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL || CONFIG_HAL_BOARD == HAL_BOARD_LINUX
 void DataFlash_File::flush(void)
 {
-    uint16_t _tail;
-    uint32_t tnow = hal.scheduler->micros();
+    uint32_t tnow = AP_HAL::millis();
     hal.scheduler->suspend_timer_procs();
-    while (_write_fd != -1 && _initialised && !_open_error &&
-           BUF_AVAILABLE(_writebuf)) {
+    while (_write_fd != -1 && _initialised && !_open_error && _writebuf.available()) {
         // convince the IO timer that it really is OK to write out
         // less than _writebuf_chunk bytes:
-        _last_write_time = tnow - 2000000;
+        if (tnow > 2001) { // avoid resetting _last_write_time to 0
+            _last_write_time = tnow - 2001;
+        }
         _io_timer();
     }
     hal.scheduler->resume_timer_procs();
@@ -924,21 +1095,33 @@ void DataFlash_File::flush(void)
 
 void DataFlash_File::_io_timer(void)
 {
-    uint16_t _tail;
+    uint32_t tnow = AP_HAL::millis();
+    _io_timer_heartbeat = tnow;
     if (_write_fd == -1 || !_initialised || _open_error) {
         return;
     }
 
-    uint16_t nbytes = BUF_AVAILABLE(_writebuf);
+    uint32_t nbytes = _writebuf.available();
     if (nbytes == 0) {
         return;
     }
-    uint32_t tnow = hal.scheduler->micros();
     if (nbytes < _writebuf_chunk && 
-        tnow - _last_write_time < 2000000UL) {
+        tnow - _last_write_time < 2000UL) {
         // write in _writebuf_chunk-sized chunks, but always write at
         // least once per 2 seconds if data is available
         return;
+    }
+    if (tnow - _free_space_last_check_time > _free_space_check_interval) {
+        _free_space_last_check_time = tnow;
+        last_io_operation = "disk_space_avail";
+        if (disk_space_avail() < _free_space_min_avail) {
+            hal.console->printf("Out of space for logging\n");
+            stop_logging();
+            _open_error = true; // prevent logging starting again
+            last_io_operation = "";
+            return;
+        }
+        last_io_operation = "";
     }
 
     hal.util->perf_begin(_perf_write);
@@ -948,13 +1131,12 @@ void DataFlash_File::_io_timer(void)
         // be kind to the FAT PX4 filesystem
         nbytes = _writebuf_chunk;
     }
-    if (_writebuf_head > _tail) {
-        // only write to the end of the buffer
-        nbytes = min(nbytes, _writebuf_size - _writebuf_head);
-    }
 
-    // try to align writes on a 512 byte boundary to avoid filesystem
-    // reads
+    uint32_t size;
+    const uint8_t *head = _writebuf.readptr(size);
+    nbytes = MIN(nbytes, size);
+
+    // try to align writes on a 512 byte boundary to avoid filesystem reads
     if ((nbytes + _write_offset) % 512 != 0) {
         uint32_t ofs = (nbytes + _write_offset) % 512;
         if (ofs < nbytes) {
@@ -962,28 +1144,74 @@ void DataFlash_File::_io_timer(void)
         }
     }
 
-    assert(_writebuf_head+nbytes <= _writebuf_size);
-    ssize_t nwritten = ::write(_write_fd, &_writebuf[_writebuf_head], nbytes);
+    last_io_operation = "write";
+    ssize_t nwritten = ::write(_write_fd, head, nbytes);
+    last_io_operation = "";
     if (nwritten <= 0) {
         hal.util->perf_count(_perf_errors);
+        last_io_operation = "close";
         close(_write_fd);
+        last_io_operation = "";
         _write_fd = -1;
         _initialised = false;
     } else {
         _write_offset += nwritten;
+        _writebuf.advance(nwritten);
         /*
-          the best strategy for minimising corruption on microSD cards
+          the best strategy for minimizing corruption on microSD cards
           seems to be to write in 4k chunks and fsync the file on each
           chunk, ensuring the directory entry is updated after each
           write.
          */
-        BUF_ADVANCEHEAD(_writebuf, nwritten);
-#if CONFIG_HAL_BOARD != HAL_BOARD_SITL && CONFIG_HAL_BOARD_SUBTYPE != HAL_BOARD_SUBTYPE_LINUX_NONE
+#if CONFIG_HAL_BOARD != HAL_BOARD_SITL && CONFIG_HAL_BOARD_SUBTYPE != HAL_BOARD_SUBTYPE_LINUX_NONE && CONFIG_HAL_BOARD != HAL_BOARD_QURT
+        last_io_operation = "fsync";
         ::fsync(_write_fd);
+        last_io_operation = "";
 #endif
     }
     hal.util->perf_end(_perf_write);
 }
 
-#endif // HAL_OS_POSIX_IO
+// this sensor is enabled if we should be logging at the moment
+bool DataFlash_File::logging_enabled() const
+{
+    if (hal.util->get_soft_armed() ||
+        _front.log_while_disarmed()) {
+        return true;
+    }
+    return false;
+}
 
+bool DataFlash_File::io_thread_alive() const
+{
+    uint32_t tnow = AP_HAL::millis();
+    // if the io thread hasn't had a heartbeat in a full second then it is dead
+    return _io_timer_heartbeat + 1000 > tnow;
+}
+
+bool DataFlash_File::logging_failed() const
+{
+    if (_open_error) {
+        return true;
+    }
+    if (!io_thread_alive()) {
+        // No heartbeat in a second.  IO thread is dead?! Very Not
+        // Good.
+        return true;
+    }
+
+    return false;
+}
+
+
+void DataFlash_File::vehicle_was_disarmed()
+{
+    if (_front._params.file_disarm_rot) {
+        // rotate our log.  Closing the current one and letting the
+        // logging restart naturally based on log_disarmed should do
+        // the trick:
+        stop_logging();
+    }
+}
+
+#endif // HAL_OS_POSIX_IO

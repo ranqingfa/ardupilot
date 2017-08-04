@@ -1,11 +1,8 @@
-
-#ifndef __AP_HAL_SCHEDULER_H__
-#define __AP_HAL_SCHEDULER_H__
+#pragma once
 
 #include <stdint.h>
 
 #include <AP_Common/AP_Common.h>
-#include <AP_Progmem/AP_Progmem.h>
 
 #include "AP_HAL_Boards.h"
 #include "AP_HAL_Namespace.h"
@@ -14,12 +11,8 @@
 class AP_HAL::Scheduler {
 public:
     Scheduler() {}
-    virtual void     init(void* implspecific) = 0;
+    virtual void     init() = 0;
     virtual void     delay(uint16_t ms) = 0;
-    virtual uint32_t millis() = 0;
-    virtual uint32_t micros() = 0;
-    virtual uint64_t millis64() = 0;
-    virtual uint64_t micros64() = 0;
 
     /*
       delay for the given number of microseconds. This needs to be as
@@ -54,22 +47,14 @@ public:
     virtual void     register_timer_failsafe(AP_HAL::Proc,
                                              uint32_t period_us) = 0;
 
-    virtual bool     system_initializing() = 0;
     virtual void     system_initialized() = 0;
 
-    virtual void     panic(const prog_char_t *errormsg, ...) FORMAT(2, 3) NORETURN = 0;
     virtual void     reboot(bool hold_in_bootloader) = 0;
-
-    /**
-       optional function to set timer speed in Hz
-     */
-    virtual void     set_timer_speed(uint16_t speed_hz) {}
 
     /**
        optional function to stop clock at a given time, used by log replay
      */
     virtual void     stop_clock(uint64_t time_usec) {}
+
+    virtual void create_uavcan_thread() {};
 };
-
-#endif // __AP_HAL_SCHEDULER_H__
-

@@ -1,4 +1,3 @@
-// -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
 /*
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -13,9 +12,7 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-
-#ifndef __AP_RANGEFINDER_BACKEND_H__
-#define __AP_RANGEFINDER_BACKEND_H__
+#pragma once
 
 #include <AP_Common/AP_Common.h>
 #include <AP_HAL/AP_HAL.h>
@@ -25,7 +22,7 @@ class AP_RangeFinder_Backend
 {
 public:
     // constructor. This incorporates initialisation as well.
-	AP_RangeFinder_Backend(RangeFinder &_ranger, uint8_t instance, RangeFinder::RangeFinder_State &_state);
+	AP_RangeFinder_Backend(RangeFinder &_ranger, uint8_t instance, RangeFinder::RangeFinder_State &_state, MAV_DISTANCE_SENSOR _sensor_type);
 
     // we declare a virtual destructor so that RangeFinder drivers can
     // override with a custom destructor if need be
@@ -39,6 +36,12 @@ public:
         return ranger._powersave_range > 0 && ranger.estimated_terrain_height > ranger._powersave_range;
     }
 
+    MAV_DISTANCE_SENSOR get_sensor_type() const {
+        return sensor_type;
+    }
+
+    virtual void handle_msg(mavlink_message_t *msg) { return; }
+
 protected:
 
     // update status based on distance measurement
@@ -49,5 +52,8 @@ protected:
 
     RangeFinder &ranger;
     RangeFinder::RangeFinder_State &state;
+    MAV_DISTANCE_SENSOR sensor_type;
+
+    // semaphore for access to shared frontend data
+    AP_HAL::Semaphore *_sem;    
 };
-#endif // __AP_RANGEFINDER_BACKEND_H__

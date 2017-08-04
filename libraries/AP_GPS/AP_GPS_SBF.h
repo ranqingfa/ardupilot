@@ -1,4 +1,3 @@
-// -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
 /*
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -18,25 +17,34 @@
 //  Septentrio GPS driver for ArduPilot.
 //	Code by Michael Oborne
 //
-
-#ifndef __AP_GPS_SBF_H__
-#define __AP_GPS_SBF_H__
+#pragma once
 
 #include "AP_GPS.h"
+#include "GPS_Backend.h"
 
 #define SBF_SETUP_MSG "\nsso, Stream1, COM1, PVTGeodetic+DOP+ExtEventPVTGeodetic, msec100\n"
+#define SBF_DISK_ACTIVITY (1 << 7)
+#define SBF_DISK_FULL     (1 << 8)
+#define SBF_DISK_MOUNTED  (1 << 9)
 
 class AP_GPS_SBF : public AP_GPS_Backend
 {
 public:
     AP_GPS_SBF(AP_GPS &_gps, AP_GPS::GPS_State &_state, AP_HAL::UARTDriver *_port);
 
-    AP_GPS::GPS_Status highest_supported_status(void) { return AP_GPS::GPS_OK_FIX_3D_RTK; }
+    AP_GPS::GPS_Status highest_supported_status(void) { return AP_GPS::GPS_OK_FIX_3D_RTK_FIXED; }
 
     // Methods
     bool read();
 
-    void inject_data(uint8_t *data, uint8_t len);
+    const char *name() const override { return "SBF"; }
+
+    bool is_configured (void) override { return (!gps._raw_data || (RxState & SBF_DISK_ACTIVITY)); }
+
+    void broadcast_configuration_failure_reason(void) const override;
+
+    // get the velocity lag, returns true if the driver is confident in the returned value
+    bool get_lag(float &lag_sec) const override { lag_sec = 0.08f; return true; } ;
 
 private:
 
@@ -45,20 +53,30 @@ private:
 
     static const uint8_t SBF_PREAMBLE1 = '$';
     static const uint8_t SBF_PREAMBLE2 = '@';
-	
-	uint8_t _init_blob_index = 0;
-	uint32_t _init_blob_time = 0;
-	const char* _initialisation_blob[4] = {
-	"sso, Stream1, COM1, PVTGeodetic+DOP+ExtEventPVTGeodetic, msec100\n",
-	"srd, Moderate, UAV\n",
-	"sem, PVT, 5\n",
-	"spm, Rover, StandAlone+DGPS+RTK\n"};
-   
-    uint32_t last_hdop = 999;
-    uint32_t crc_error_counter = 0;
-	uint32_t last_injected_data_ms = 0;
 
-    struct PACKED msg4007
+    uint8_t _init_blob_index = 0;
+    uint32_t _init_blob_time = 0;
+    const char* _initialisation_blob[5] = {
+    "sso, Stream1, COM1, PVTGeodetic+DOP+ExtEventPVTGeodetic+ReceiverStatus+VelCovGeodetic, msec100\n",
+    "srd, Moderate, UAV\n",
+    "sem, PVT, 5\n",
+    "spm, Rover, StandAlone+SBAS+DGPS+RTK\n",
+    "sso, Stream2, Dsk1, postprocess+event, msec100\n"};
+   
+    uint32_t crc_error_counter = 0;
+    uint32_t last_injected_data_ms = 0;
+    bool validcommand = false;
+    uint32_t RxState;
+
+    enum sbf_ids {
+        DOP = 4001,
+        PVTGeodetic = 4007,
+        ReceiverStatus = 4014,
+        ExtEventPVTGeodetic = 4038,
+        VelCovGeodetic = 5908
+    };
+
+    struct PACKED msg4007 // PVTGeodetic
     {
          uint32_t TOW;
          uint16_t WNc;
@@ -82,17 +100,17 @@ private:
          uint16_t MeanCorrAge;
          uint32_t SignalInfo;
          uint8_t AlertFlag;
-		 // rev1
-		 uint8_t NrBases;
-		 uint16_t PPPInfo;
-		 // rev2
-		 uint16_t Latency;
-		 uint16_t HAccuracy;
-		 uint16_t VAccuracy;
-		 uint8_t Misc;
+         // rev1
+         uint8_t NrBases;
+         uint16_t PPPInfo;
+         // rev2
+         uint16_t Latency;
+         uint16_t HAccuracy;
+         uint16_t VAccuracy;
+         uint8_t Misc;
     };
   
-    struct PACKED msg4001
+    struct PACKED msg4001 // DOP
     {
          uint32_t TOW;
          uint16_t WNc;
@@ -104,14 +122,46 @@ private:
          uint16_t VDOP;
          float HPL;
          float VPL;
-    };	
-	
-	union PACKED msgbuffer {
+    };
+
+    struct PACKED msg4014 // ReceiverStatus (v2)
+    {
+         uint32_t TOW;
+         uint16_t WNc;
+         uint8_t CPULoad;
+         uint8_t ExtError;
+         uint32_t UpTime;
+         uint32_t RxState;
+         uint32_t RxError;
+         // remaining data is AGCData, which we don't have a use for, don't extract the data
+    };
+
+    struct PACKED msg5908 // VelCovGeodetic
+    {
+        uint32_t TOW;
+        uint16_t WNc;
+        uint8_t Mode;
+        uint8_t Error;
+        float Cov_VnVn;
+        float Cov_VeVe;
+        float Cov_VuVu;
+        float Cov_DtDt;
+        float Cov_VnVe;
+        float Cov_VnVu;
+        float Cov_VnDt;
+        float Cov_VeVu;
+        float Cov_VeDt;
+        float Cov_VuDt;
+    };
+
+    union PACKED msgbuffer {
         msg4007 msg4007u;
-		msg4001 msg4001u;
+        msg4001 msg4001u;
+        msg4014 msg4014u;
+        msg5908 msg5908u;
         uint8_t bytes[128];
     };
-	
+
     struct sbf_msg_parser_t
     {
         enum
@@ -133,9 +183,6 @@ private:
         msgbuffer data;
         uint16_t read;
     } sbf_msg;
-		
+
     void log_ExtEventPVTGeodetic(const msg4007 &temp);
 };
-
-#endif // __AP_GPS_SBF_H__
-
