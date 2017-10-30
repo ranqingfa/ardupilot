@@ -13,7 +13,6 @@
 #include <AP_Vehicle/AP_Vehicle_Type.h>
 
 #include "RCInput.h"
-#include "RPIOUARTDriver.h"
 #include "SPIUARTDriver.h"
 #include "Storage.h"
 #include "UARTDriver.h"
@@ -43,7 +42,6 @@ extern const AP_HAL::HAL& hal;
     CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_ERLEBRAIN2 || \
     CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_BH || \
     CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_DARK || \
-    CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_URUS || \
     CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_PXFMINI
 #define APM_LINUX_RCIN_RATE             2000
 #define APM_LINUX_TONEALARM_RATE        100
@@ -82,6 +80,8 @@ void Scheduler::init()
         SCHED_THREAD(tonealarm, TONEALARM),
         SCHED_THREAD(io, IO),
     };
+
+    _main_ctx = pthread_self();
 
 #if !APM_BUILD_TYPE(APM_BUILD_Replay)
     // we don't run Replay in real-time...
@@ -148,6 +148,12 @@ void Scheduler::delay(uint16_t ms)
     if (_stopped_clock_usec) {
         return;
     }
+
+    if (!in_main_thread()) {
+        fprintf(stderr, "Scheduler::delay() called outside main thread\n");
+        return;
+    }
+
     uint64_t start = AP_HAL::millis64();
 
     while ((AP_HAL::millis64() - start) < ms) {
@@ -247,13 +253,6 @@ void Scheduler::_timer_task()
         }
     }
 
-#if CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_RASPILOT
-    //SPI UART use SPI
-    if (!((RPIOUARTDriver *)hal.uartC)->isExternal()) {
-        ((RPIOUARTDriver *)hal.uartC)->_timer_tick();
-    }
-#endif
-
     _timer_semaphore.give();
 
     // and the failsafe, if one is setup
@@ -298,14 +297,7 @@ void Scheduler::_run_uarts()
     // process any pending serial bytes
     UARTDriver::from(hal.uartA)->_timer_tick();
     UARTDriver::from(hal.uartB)->_timer_tick();
-#if CONFIG_HAL_BOARD_SUBTYPE == HAL_BOARD_SUBTYPE_LINUX_RASPILOT
-    //SPI UART not use SPI
-    if (RPIOUARTDriver::from(hal.uartC)->isExternal()) {
-        RPIOUARTDriver::from(hal.uartC)->_timer_tick();
-    }
-#else
     UARTDriver::from(hal.uartC)->_timer_tick();
-#endif
     UARTDriver::from(hal.uartD)->_timer_tick();
     UARTDriver::from(hal.uartE)->_timer_tick();
     UARTDriver::from(hal.uartF)->_timer_tick();
@@ -340,9 +332,9 @@ void Scheduler::_io_task()
     _run_io();
 }
 
-bool Scheduler::in_timerprocess()
+bool Scheduler::in_main_thread() const
 {
-    return _in_timer_proc;
+    return pthread_equal(pthread_self(), _main_ctx);
 }
 
 void Scheduler::_wait_all_threads()

@@ -27,8 +27,7 @@ void Copter::esc_calibration_startup_check()
     }
 
     // exit immediately if pre-arm rc checks fail
-    arming.pre_arm_rc_checks(true);
-    if (!ap.pre_arm_rc_check) {
+    if (!arming.rc_calibration_checks(true)) {
         // clear esc flag for next time
         if ((g.esc_calibrate != ESCCAL_NONE) && (g.esc_calibrate != ESCCAL_DISABLED)) {
             g.esc_calibrate.set_and_save(ESCCAL_NONE);
@@ -102,7 +101,6 @@ void Copter::esc_calibration_passthrough()
 
     // arm motors
     motors->armed(true);
-    motors->enable();
     SRV_Channels::enable_by_mask(motors->get_motor_mask());
     hal.util->set_soft_armed(true);
 
@@ -150,7 +148,6 @@ void Copter::esc_calibration_auto()
 
     // arm and enable motors
     motors->armed(true);
-    motors->enable();
     SRV_Channels::enable_by_mask(motors->get_motor_mask());
     hal.util->set_soft_armed(true);
 

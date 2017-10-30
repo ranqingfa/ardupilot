@@ -122,8 +122,6 @@ public:
     virtual void vehicle_was_disarmed() { };
 
 protected:
-    uint32_t dropped;
-    uint8_t internal_errors; // uint8_t - wishful thinking?
 
     DataFlash_Class &_front;
 
@@ -138,7 +136,7 @@ protected:
                           print_mode_fn print_mode,
                           AP_HAL::BetterStream *port);
 
-    bool ShouldLog() const;
+    bool ShouldLog(bool is_critical);
     virtual bool WritesOK() const = 0;
     virtual bool StartNewLogOK() const;
 
@@ -154,7 +152,7 @@ protected:
     DFMessageWriter_DFLogStart *_startup_messagewriter;
     bool _writing_startup_messages;
 
-    uint32_t _internal_errors;
+    uint8_t _internal_errors;
     uint32_t _dropped;
 
     // must be called when a new log is being started:
@@ -168,5 +166,5 @@ private:
 
     uint32_t _last_periodic_1Hz;
     uint32_t _last_periodic_10Hz;
-
+    bool have_logged_armed;
 };
